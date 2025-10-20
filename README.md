@@ -1,4 +1,4 @@
-# Assignment 2: JWT Hardening Lab (Detailed Walkthrough)
+# JWT Hardening Lab (Detailed Walkthrough)
 
 ---
 
