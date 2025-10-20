@@ -6,7 +6,17 @@
 
 ---
 
-https://youtu.be/O_KLRpVuBlo
+---
+
+## 🎥 Demo Video
+
+Watch the full project walkthrough on YouTube:  
+👉 [**JWT Hardening Lab — Video Demonstration**](https://youtu.be/O_KLRpVuBlo)
+
+[![Watch the video](https://img.youtube.com/vi/O_KLRpVuBlo/0.jpg)](https://youtu.be/O_KLRpVuBlo)
+
+---
+
 
 ## Table of contents
 
